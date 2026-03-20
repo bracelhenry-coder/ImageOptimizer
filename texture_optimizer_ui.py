@@ -3,10 +3,10 @@ from pathlib import Path
 
 from PySide2.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QMessageBox, QProgressDialog, QComboBox, QSpinBox
+    QFileDialog, QMessageBox, QProgressDialog, QComboBox, QSpinBox, QTabWidget
 )
-from PySide2.QtGui import QPixmap, QImage
-from PySide2.QtCore import Qt
+from PySide2.QtGui import QPixmap, QImage, QPainter, QPen, QColor
+from PySide2.QtCore import Qt, Signal
 
 from PIL import Image, ImageDraw
 
@@ -72,6 +72,268 @@ def draw_canvas_preview(content_img, canvas_w, canvas_h, preview_size=300):
     return canvas
 
 
+class ManualCropLabel(QLabel):
+    rectChanged = Signal(tuple)
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._pil_image = None
+        self._pixmap = None
+        self._manual_enabled = False
+        self._rect = None
+        self._drag_mode = None
+        self._drag_start = None
+        self._start_rect = None
+        self._geom = (0, 0, 0, 0, 1.0)  # ox, oy, dw, dh, scale
+        self._manual_zoom = 1.35
+        self._focus_center = None  # (x, y) in image coordinates
+        self.setMouseTracking(True)
+
+    def set_manual_zoom(self, zoom):
+        self._manual_zoom = max(0.5, min(8.0, float(zoom)))
+        self.update()
+
+    def get_manual_zoom(self):
+        return self._manual_zoom
+
+    def set_manual_state(self, pil_img, rect):
+        self._pil_image = pil_img
+        self._pixmap = pil_to_qpixmap(pil_img)
+        self._manual_enabled = True
+        self._rect = tuple(int(v) for v in rect)
+        l, t, r, b = self._rect
+        self._focus_center = ((l + r) / 2.0, (t + b) / 2.0)
+        self.update()
+
+    def disable_manual(self):
+        self._manual_enabled = False
+        self._pil_image = None
+        self._pixmap = None
+        self._rect = None
+        self._drag_mode = None
+        self._drag_start = None
+        self._start_rect = None
+        self._focus_center = None
+        self.update()
+
+    def _compute_draw_geometry(self):
+        if self._pil_image is None:
+            return (0, 0, 0, 0, 1.0)
+        iw, ih = self._pil_image.size
+        if iw <= 0 or ih <= 0:
+            return (0, 0, 0, 0, 1.0)
+        avail_w = max(1, self.width() - 8)
+        avail_h = max(1, self.height() - 8)
+        scale = min(avail_w / iw, avail_h / ih)
+        if self._manual_enabled:
+            scale *= self._manual_zoom
+        dw = max(1, int(iw * scale))
+        dh = max(1, int(ih * scale))
+
+        if self._manual_enabled and self._focus_center is not None:
+            fx, fy = self._focus_center
+            ox = int((self.width() / 2.0) - (fx * scale))
+            oy = int((self.height() / 2.0) - (fy * scale))
+
+            # Clamp so viewport remains stable and valid.
+            if dw >= self.width():
+                ox = max(self.width() - dw, min(0, ox))
+            else:
+                ox = (self.width() - dw) // 2
+
+            if dh >= self.height():
+                oy = max(self.height() - dh, min(0, oy))
+            else:
+                oy = (self.height() - dh) // 2
+        else:
+            ox = (self.width() - dw) // 2
+            oy = (self.height() - dh) // 2
+
+        return (ox, oy, dw, dh, scale)
+
+    def _draw_checkerboard(self, painter, x, y, w, h):
+        if w <= 0 or h <= 0:
+            return
+        check = 12
+        c1 = QColor(52, 52, 52)
+        c2 = QColor(32, 32, 32)
+        end_x = x + w
+        end_y = y + h
+        for yy in range(y, end_y, check):
+            for xx in range(x, end_x, check):
+                painter.fillRect(
+                    xx,
+                    yy,
+                    min(check, end_x - xx),
+                    min(check, end_y - yy),
+                    c1 if ((xx // check) + (yy // check)) % 2 == 0 else c2
+                )
+
+    def paintEvent(self, event):
+        if not self._manual_enabled or self._pil_image is None or self._pixmap is None or self._rect is None:
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#1f1f1f"))
+
+        ox, oy, dw, dh, scale = self._compute_draw_geometry()
+        self._geom = (ox, oy, dw, dh, scale)
+
+        l, t, r, b = self._rect
+        x = int(ox + l * scale)
+        y = int(oy + t * scale)
+        w = int((r - l) * scale)
+        h = int((b - t) * scale)
+
+        # Checkerboard only inside the manual crop box.
+        self._draw_checkerboard(painter, x, y, max(1, w), max(1, h))
+
+        scaled = self._pixmap.scaled(dw, dh, Qt.KeepAspectRatio, Qt.FastTransformation)
+        painter.drawPixmap(ox, oy, scaled)
+
+        # Dim outside crop box to keep focus centered.
+        shade = QColor(0, 0, 0, 90)
+        painter.fillRect(0, 0, self.width(), max(0, y), shade)
+        painter.fillRect(0, y + h, self.width(), max(0, self.height() - (y + h)), shade)
+        painter.fillRect(0, y, max(0, x), max(0, h), shade)
+        painter.fillRect(x + w, y, max(0, self.width() - (x + w)), max(0, h), shade)
+
+        pen = QPen(QColor(0, 255, 0), 2)
+        painter.setPen(pen)
+        painter.drawRect(x, y, max(1, w), max(1, h))
+
+        # Handles
+        hs = 6
+        painter.setBrush(QColor(0, 255, 0))
+        painter.drawRect(x - hs // 2, y - hs // 2, hs, hs)
+        painter.drawRect(x + w - hs // 2, y - hs // 2, hs, hs)
+        painter.drawRect(x - hs // 2, y + h - hs // 2, hs, hs)
+        painter.drawRect(x + w - hs // 2, y + h - hs // 2, hs, hs)
+
+        size_text = f"{max(1, r - l)} × {max(1, b - t)}"
+        painter.setPen(QColor(0, 0, 0))
+        painter.fillRect(x, max(0, y - 24), 110, 20, QColor(0, 255, 0))
+        painter.drawText(x + 6, max(14, y - 9), size_text)
+        painter.end()
+
+    def _to_image_pos(self, px, py):
+        ox, oy, dw, dh, scale = self._geom
+        if dw <= 0 or dh <= 0:
+            return (0, 0)
+        rx = (px - ox) / max(1e-8, scale)
+        ry = (py - oy) / max(1e-8, scale)
+        if self._pil_image is None:
+            return (0, 0)
+        iw, ih = self._pil_image.size
+        rx = max(0, min(iw, int(round(rx))))
+        ry = max(0, min(ih, int(round(ry))))
+        return (rx, ry)
+
+    def _hit_mode(self, px, py):
+        if self._rect is None:
+            return None
+        ox, oy, _, _, scale = self._geom
+        l, t, r, b = self._rect
+        x1 = int(ox + l * scale)
+        y1 = int(oy + t * scale)
+        x2 = int(ox + r * scale)
+        y2 = int(oy + b * scale)
+        m = 8
+
+        near_l = abs(px - x1) <= m
+        near_r = abs(px - x2) <= m
+        near_t = abs(py - y1) <= m
+        near_b = abs(py - y2) <= m
+        inside = (x1 < px < x2 and y1 < py < y2)
+
+        if near_l and near_t:
+            return "tl"
+        if near_r and near_t:
+            return "tr"
+        if near_l and near_b:
+            return "bl"
+        if near_r and near_b:
+            return "br"
+        if near_l and y1 <= py <= y2:
+            return "l"
+        if near_r and y1 <= py <= y2:
+            return "r"
+        if near_t and x1 <= px <= x2:
+            return "t"
+        if near_b and x1 <= px <= x2:
+            return "b"
+        if inside:
+            return "move"
+        return None
+
+    def mousePressEvent(self, event):
+        if not self._manual_enabled or self._pil_image is None or self._rect is None:
+            super().mousePressEvent(event)
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        mode = self._hit_mode(event.x(), event.y())
+        if mode is None:
+            return
+        self._drag_mode = mode
+        self._drag_start = self._to_image_pos(event.x(), event.y())
+        self._start_rect = self._rect
+
+    def mouseMoveEvent(self, event):
+        if not self._manual_enabled or self._pil_image is None or self._rect is None:
+            super().mouseMoveEvent(event)
+            return
+
+        if self._drag_mode is None or self._drag_start is None or self._start_rect is None:
+            mode = self._hit_mode(event.x(), event.y())
+            if mode in {"move", "l", "r", "t", "b", "tl", "tr", "bl", "br"}:
+                self.setCursor(Qt.SizeAllCursor if mode == "move" else Qt.CrossCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            return
+
+        cx, cy = self._to_image_pos(event.x(), event.y())
+        sx, sy = self._drag_start
+        dx = cx - sx
+        dy = cy - sy
+
+        l, t, r, b = self._start_rect
+        iw, ih = self._pil_image.size
+        min_size = 4
+
+        if self._drag_mode == "move":
+            w = r - l
+            h = b - t
+            nl = max(0, min(iw - w, l + dx))
+            nt = max(0, min(ih - h, t + dy))
+            nr = nl + w
+            nb = nt + h
+        else:
+            nl, nt, nr, nb = l, t, r, b
+            if "l" in self._drag_mode:
+                nl = max(0, min(r - min_size, l + dx))
+            if "r" in self._drag_mode:
+                nr = min(iw, max(l + min_size, r + dx))
+            if "t" in self._drag_mode:
+                nt = max(0, min(b - min_size, t + dy))
+            if "b" in self._drag_mode:
+                nb = min(ih, max(t + min_size, b + dy))
+
+        new_rect = (int(nl), int(nt), int(nr), int(nb))
+        if new_rect != self._rect:
+            self._rect = new_rect
+            self.rectChanged.emit(self._rect)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_mode = None
+        self._drag_start = None
+        self._start_rect = None
+        self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+
 class TextureOptimizerUI(QWidget):
     ALERT_INFO_STYLE = (
         "color: #ffb3b3;"
@@ -86,11 +348,16 @@ class TextureOptimizerUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Texture Memory Optimizer")
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
         self.setStyleSheet(open("style.qss").read())
 
         self.original_path = None
         self.original_image = None
         self.cropped_image = None
+        self.manual_base_image = None
+        self.manual_rect = None
+        self.multi_folder = None
+        self.multi_frame_paths = []
 
         self.init_ui()
 
@@ -117,7 +384,7 @@ class TextureOptimizerUI(QWidget):
 
         # Mode dropdown next to the Optimized title
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Auto", "128 × 128", "256 × 256", "512 × 512", "1024 × 1024", "2048 × 2048", "Custom..."])
+        self.mode_combo.addItems(["Auto", "Manual", "128 × 128", "256 × 256", "512 × 512", "1024 × 1024", "2048 × 2048", "Custom..."])
         self.mode_combo.setObjectName("sizeCombo")
         self.mode_combo.setFixedWidth(130)
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
@@ -161,6 +428,31 @@ class TextureOptimizerUI(QWidget):
         self.custom_row_widget.setLayout(custom_row_layout)
         self.custom_row_widget.setVisible(False)
 
+        # Manual zoom row (only visible in Manual mode)
+        self.manual_zoom_out_btn = QPushButton("-")
+        self.manual_zoom_out_btn.setFixedWidth(28)
+        self.manual_zoom_out_btn.clicked.connect(self._manual_zoom_out)
+        self.manual_zoom_out_btn.setEnabled(False)
+
+        self.manual_zoom_label = QLabel("Zoom: 135%")
+        self.manual_zoom_label.setAlignment(Qt.AlignCenter)
+
+        self.manual_zoom_in_btn = QPushButton("+")
+        self.manual_zoom_in_btn.setFixedWidth(28)
+        self.manual_zoom_in_btn.clicked.connect(self._manual_zoom_in)
+        self.manual_zoom_in_btn.setEnabled(False)
+
+        manual_zoom_layout = QHBoxLayout()
+        manual_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        manual_zoom_layout.addStretch()
+        manual_zoom_layout.addWidget(self.manual_zoom_out_btn)
+        manual_zoom_layout.addWidget(self.manual_zoom_label)
+        manual_zoom_layout.addWidget(self.manual_zoom_in_btn)
+
+        self.manual_zoom_widget = QWidget()
+        self.manual_zoom_widget.setLayout(manual_zoom_layout)
+        self.manual_zoom_widget.setVisible(False)
+
         optimized_header = QHBoxLayout()
         optimized_header.addWidget(self.cropped_title)
         optimized_header.addStretch()
@@ -170,10 +462,12 @@ class TextureOptimizerUI(QWidget):
         optimized_header_col.setSpacing(2)
         optimized_header_col.addLayout(optimized_header)
         optimized_header_col.addWidget(self.custom_row_widget)
+        optimized_header_col.addWidget(self.manual_zoom_widget)
 
-        self.cropped_preview = QLabel("No crop yet")
+        self.cropped_preview = ManualCropLabel("No crop yet")
         self.cropped_preview.setAlignment(Qt.AlignCenter)
         self.cropped_preview.setObjectName("imagePreview")
+        self.cropped_preview.rectChanged.connect(self._on_manual_rect_changed)
 
         self.cropped_info = QLabel("Size: -\nMemory: -\nSaved: -")
         self.cropped_info.setObjectName("infoLabel")
@@ -192,10 +486,6 @@ class TextureOptimizerUI(QWidget):
         self.select_btn = QPushButton("Select Image")
         self.select_btn.clicked.connect(self.open_file_dialog)
 
-        self.auto_crop_btn = QPushButton("Crop")
-        self.auto_crop_btn.clicked.connect(self.handle_auto_crop)
-        self.auto_crop_btn.setEnabled(False)
-
         self.export_btn = QPushButton("Export")
         self.export_btn.clicked.connect(self.handle_export)
         self.export_btn.setObjectName("exportButton")
@@ -207,20 +497,116 @@ class TextureOptimizerUI(QWidget):
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.select_btn)
-        button_layout.addWidget(self.auto_crop_btn)
         button_layout.addWidget(self.export_btn)
 
-        # Main layout
+        # --- Single Frame page ---
         images_layout = QHBoxLayout()
         images_layout.addLayout(original_layout)
         images_layout.addLayout(cropped_layout)
 
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(images_layout)
-        main_layout.addWidget(self.summary_label)
-        main_layout.addLayout(button_layout)
+        single_page_layout = QVBoxLayout()
+        single_page_layout.setContentsMargins(8, 8, 8, 8)
+        single_page_layout.addLayout(images_layout)
+        single_page_layout.addWidget(self.summary_label)
+        single_page_layout.addLayout(button_layout)
 
-        self.setLayout(main_layout)
+        single_frame_widget = QWidget()
+        single_frame_widget.setLayout(single_page_layout)
+
+        # --- Multi Frame page ---
+        multi_title = QLabel("Multi Frame")
+        multi_title.setObjectName("panelTitle")
+
+        multi_select_row = QHBoxLayout()
+        multi_select_row.addWidget(QLabel("Select Frame:"))
+
+        self.multi_frame_combo = QComboBox()
+        self.multi_frame_combo.setObjectName("sizeCombo")
+        self.multi_frame_combo.setMinimumWidth(220)
+        self.multi_frame_combo.setEnabled(False)
+        self.multi_frame_combo.currentIndexChanged.connect(self.refresh_multi_frame_preview)
+        multi_select_row.addWidget(self.multi_frame_combo)
+
+        self.multi_mode_combo = QComboBox()
+        self.multi_mode_combo.setObjectName("sizeCombo")
+        self.multi_mode_combo.setFixedWidth(130)
+        self.multi_mode_combo.addItems(["Auto", "128 × 128", "256 × 256", "512 × 512", "1024 × 1024", "2048 × 2048"])
+        self.multi_mode_combo.setEnabled(False)
+        self.multi_mode_combo.currentTextChanged.connect(self.refresh_multi_frame_preview)
+        multi_select_row.addSpacing(8)
+        multi_select_row.addWidget(self.multi_mode_combo)
+        multi_select_row.addStretch()
+
+        self.multi_original_preview = QLabel("No frame loaded")
+        self.multi_original_preview.setAlignment(Qt.AlignCenter)
+        self.multi_original_preview.setObjectName("imagePreview")
+
+        self.multi_original_info = QLabel("Size: -\nMemory: -")
+        self.multi_original_info.setObjectName("infoLabel")
+
+        self.multi_cropped_preview = QLabel("No optimized frame yet")
+        self.multi_cropped_preview.setAlignment(Qt.AlignCenter)
+        self.multi_cropped_preview.setObjectName("imagePreview")
+
+        self.multi_cropped_info = QLabel("Size: -\nMemory: -\nSaved: -")
+        self.multi_cropped_info.setObjectName("infoLabel")
+
+        multi_left = QVBoxLayout()
+        multi_left.addWidget(QLabel("Original Frame"))
+        multi_left.addWidget(self.multi_original_preview)
+        multi_left.addWidget(self.multi_original_info)
+
+        multi_right = QVBoxLayout()
+        multi_right.addWidget(QLabel("Optimized Frame"))
+        multi_right.addWidget(self.multi_cropped_preview)
+        multi_right.addWidget(self.multi_cropped_info)
+
+        multi_images = QHBoxLayout()
+        multi_images.addLayout(multi_left)
+        multi_images.addLayout(multi_right)
+
+        self.multi_info_label = QLabel("Select a folder to load all frames.")
+        self.multi_info_label.setObjectName("summaryLabel")
+        self.multi_info_label.setAlignment(Qt.AlignCenter)
+
+        self.multi_select_btn = QPushButton("Select Folder")
+        self.multi_select_btn.clicked.connect(self.open_multi_images)
+
+        self.multi_export_frame_btn = QPushButton("Export Frame")
+        self.multi_export_frame_btn.setObjectName("exportButton")
+        self.multi_export_frame_btn.setEnabled(False)
+        self.multi_export_frame_btn.clicked.connect(self.export_selected_multi_frame)
+
+        self.multi_export_all_btn = QPushButton("Export All Frames")
+        self.multi_export_all_btn.setObjectName("exportButton")
+        self.multi_export_all_btn.setEnabled(False)
+        self.multi_export_all_btn.clicked.connect(self.export_all_multi_frames)
+
+        multi_buttons = QHBoxLayout()
+        multi_buttons.addWidget(self.multi_select_btn)
+        multi_buttons.addWidget(self.multi_export_frame_btn)
+        multi_buttons.addWidget(self.multi_export_all_btn)
+
+        multi_frame_layout = QVBoxLayout()
+        multi_frame_layout.setContentsMargins(8, 8, 8, 8)
+        multi_frame_layout.addWidget(multi_title)
+        multi_frame_layout.addLayout(multi_select_row)
+        multi_frame_layout.addLayout(multi_images)
+        multi_frame_layout.addWidget(self.multi_info_label)
+        multi_frame_layout.addLayout(multi_buttons)
+
+        multi_frame_widget = QWidget()
+        multi_frame_widget.setLayout(multi_frame_layout)
+
+        # --- Tab widget ---
+        self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(single_frame_widget, "Single Frame")
+        self.tab_widget.addTab(multi_frame_widget, "Multi Frame")
+
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.addWidget(self.tab_widget)
+        self.setLayout(outer_layout)
 
     # ---------------------------
     # Mode dropdown helpers
@@ -230,6 +616,18 @@ class TextureOptimizerUI(QWidget):
         self.custom_w_spin.setEnabled(text == "Custom..." and self.original_image is not None)
         self.custom_h_spin.setEnabled(text == "Custom..." and self.original_image is not None)
         self.custom_apply_btn.setEnabled(text == "Custom..." and self.original_image is not None)
+        self.manual_zoom_widget.setVisible(text == "Manual")
+        self.manual_zoom_out_btn.setEnabled(text == "Manual" and self.original_image is not None)
+        self.manual_zoom_in_btn.setEnabled(text == "Manual" and self.original_image is not None)
+
+        if text != "Manual":
+            self.cropped_preview.disable_manual()
+
+        if text == "Manual" and self.original_image is not None:
+            self.summary_label.setText("Manual mode: zoomed view + checkerboard. Drag the green rectangle; size updates live.")
+            self.start_manual_crop()
+            return
+
         if text == "Custom..." and self.original_image is not None:
             self.summary_label.setText("Set custom size and press Update.")
         if self.original_image is not None and text != "Custom...":
@@ -239,13 +637,31 @@ class TextureOptimizerUI(QWidget):
         if self.mode_combo.currentText() == "Custom..." and self.original_image is not None:
             self.handle_auto_crop()
 
+    def _update_manual_zoom_ui(self):
+        self.manual_zoom_label.setText(f"Zoom: {int(self.cropped_preview.get_manual_zoom() * 100)}%")
+
+    def _manual_zoom_in(self):
+        self.cropped_preview.set_manual_zoom(self.cropped_preview.get_manual_zoom() * 1.15)
+        self._update_manual_zoom_ui()
+
+    def _manual_zoom_out(self):
+        self.cropped_preview.set_manual_zoom(self.cropped_preview.get_manual_zoom() / 1.15)
+        self._update_manual_zoom_ui()
+
     def get_target_canvas_size(self):
         """Returns (width, height) or None for Auto (tight crop)."""
         text = self.mode_combo.currentText()
-        if text == "Auto":
+        if text in ("Auto", "Manual"):
             return None
         if text == "Custom...":
             return (self.custom_w_spin.value(), self.custom_h_spin.value())
+        n = int(text.split("×")[0].strip())
+        return (n, n)
+
+    def get_multi_target_canvas_size(self):
+        text = self.multi_mode_combo.currentText()
+        if text == "Auto":
+            return None
         n = int(text.split("×")[0].strip())
         return (n, n)
 
@@ -274,11 +690,14 @@ class TextureOptimizerUI(QWidget):
         self.original_path = path
         self.original_image = img
         self.cropped_image = None
-        self.auto_crop_btn.setEnabled(True)
+        self.manual_base_image = None
+        self.manual_rect = None
         self.mode_combo.setEnabled(True)
         self.custom_w_spin.setEnabled(self.mode_combo.currentText() == "Custom...")
         self.custom_h_spin.setEnabled(self.mode_combo.currentText() == "Custom...")
         self.custom_apply_btn.setEnabled(self.mode_combo.currentText() == "Custom...")
+        self.manual_zoom_out_btn.setEnabled(self.mode_combo.currentText() == "Manual")
+        self.manual_zoom_in_btn.setEnabled(self.mode_combo.currentText() == "Manual")
         self.export_btn.setEnabled(False)
 
         pixmap = pil_to_qpixmap(img)
@@ -321,13 +740,93 @@ class TextureOptimizerUI(QWidget):
         self.cropped_info.setText("Size: -\nMemory: -\nSaved: -")
         if self.mode_combo.currentText() == "Custom...":
             self.summary_label.setText("Image loaded. Set custom size and press Update.")
+        elif self.mode_combo.currentText() == "Manual":
+            self.summary_label.setText("Image loaded. Starting Manual mode...")
         else:
             self.summary_label.setText("Image loaded. Running Auto crop...")
         QApplication.processEvents()
 
         # Auto-run crop immediately on load, except Custom mode which waits for Update.
-        if self.mode_combo.currentText() != "Custom...":
+        if self.mode_combo.currentText() == "Manual":
+            self.start_manual_crop()
+        elif self.mode_combo.currentText() != "Custom...":
             self.handle_auto_crop()
+
+    def start_manual_crop(self):
+        if self.original_image is None:
+            return
+
+        progress = QProgressDialog("Preparing manual crop...", None, 0, 100, self)
+        progress.setWindowTitle("Manual Crop")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        try:
+            img = self.original_image.convert("RGBA")
+            progress.setValue(20)
+            QApplication.processEvents()
+
+            progress.setLabelText("Removing background...")
+            progress.setValue(40)
+            QApplication.processEvents()
+            img = remove_background(img)
+
+            progress.setLabelText("Finding initial crop area...")
+            progress.setValue(80)
+            QApplication.processEvents()
+            bbox = img.split()[3].getbbox()
+            if bbox is None:
+                progress.close()
+                QMessageBox.information(self, "Info", "No visible pixels found.")
+                return
+
+            bbox = expand_bbox_to_multiple_of_4(bbox, img.size)
+
+            self.manual_base_image = img
+            self.manual_rect = bbox
+            self.cropped_preview.set_manual_state(img, bbox)
+            self._update_manual_zoom_ui()
+            self._on_manual_rect_changed(bbox)
+
+            progress.setValue(100)
+            QApplication.processEvents()
+        finally:
+            progress.close()
+
+    def _on_manual_rect_changed(self, rect):
+        if self.mode_combo.currentText() != "Manual":
+            return
+        if self.manual_base_image is None:
+            return
+
+        self.manual_rect = tuple(int(v) for v in rect)
+        l, t, r, b = self.manual_rect
+        if r <= l or b <= t:
+            return
+
+        cropped = crop_to_bbox(self.manual_base_image, self.manual_rect)
+        final = expand_to_multiple_of_4(cropped)
+        self.cropped_image = final
+        self.export_btn.setEnabled(True)
+
+        ow, oh = self.original_image.size
+        orig_mem = estimate_memory_mb(ow, oh)
+        fw, fh = final.size
+        final_mem = estimate_memory_mb(fw, fh)
+        saved = orig_mem - final_mem
+        saved_pct = (saved / orig_mem) * 100 if orig_mem > 0 else 0
+
+        cw, ch = cropped.size
+        self.cropped_info.setText(
+            f"Manual: {cw}×{ch}\n"
+            f"Final: {fw}×{fh}\n"
+            f"Memory: {final_mem:.2f} MB\n"
+            f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
+        )
+        self.summary_label.setText(f"Manual selection: {cw}×{ch} (drag green box)")
 
     # ---------------------------
     # Auto crop
@@ -496,6 +995,205 @@ class TextureOptimizerUI(QWidget):
             return
 
         QMessageBox.information(self, "Saved", f"Saved to:\n{save_path}")
+
+    # ---------------------------
+    # Multi frame
+    # ---------------------------
+    def open_multi_images(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Frames Folder",
+            ""
+        )
+        if not folder_path:
+            return
+
+        folder = Path(folder_path)
+        allowed = {".png", ".jpg", ".jpeg", ".bmp"}
+        frames = sorted(
+            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in allowed],
+            key=lambda p: p.name.lower()
+        )
+
+        if not frames:
+            QMessageBox.information(self, "Info", "No image frames found in that folder.")
+            return
+
+        self.multi_folder = folder
+        self.multi_frame_paths = frames
+
+        self.multi_frame_combo.blockSignals(True)
+        self.multi_frame_combo.clear()
+        for i, p in enumerate(frames):
+            self.multi_frame_combo.addItem(f"Frame {i + 1}", str(p))
+        self.multi_frame_combo.setCurrentIndex(0)
+        self.multi_frame_combo.blockSignals(False)
+
+        self.multi_frame_combo.setEnabled(True)
+        self.multi_mode_combo.setEnabled(True)
+        self.multi_export_frame_btn.setEnabled(True)
+        self.multi_export_all_btn.setEnabled(True)
+        self.multi_info_label.setText(f"Loaded {len(frames)} frames from: {folder.name}")
+        self.refresh_multi_frame_preview()
+
+    def optimize_image_for_export(self, source_img, target=None):
+        img = source_img.convert("RGBA")
+        img = remove_background(img)
+
+        bbox = img.split()[3].getbbox()
+        if bbox is None:
+            raise ValueError("No visible pixels found after background removal.")
+
+        bbox = expand_bbox_to_multiple_of_4(bbox, img.size)
+        cropped = crop_to_bbox(img, bbox)
+
+        if target is not None:
+            tw, th = target
+            cw, ch = cropped.size
+            if cw > tw or ch > th:
+                raise ValueError(
+                    f"Cropped content ({cw}×{ch}) is larger than target ({tw}×{th})."
+                )
+            canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+            offset_x = (tw - cw) // 2
+            offset_y = (th - ch) // 2
+            canvas.paste(cropped, (offset_x, offset_y))
+            return canvas
+
+        return expand_to_multiple_of_4(cropped)
+
+    def refresh_multi_frame_preview(self):
+        if not self.multi_frame_paths:
+            return
+
+        current_path = self.multi_frame_combo.currentData()
+        if not current_path:
+            return
+
+        try:
+            src = Path(current_path)
+            img = Image.open(str(src))
+            target = self.get_multi_target_canvas_size()
+            out_img = self.optimize_image_for_export(img, target=target)
+
+            self.multi_original_preview.setPixmap(
+                pil_to_qpixmap(img).scaled(300, 300, Qt.KeepAspectRatio)
+            )
+            self.multi_cropped_preview.setPixmap(
+                pil_to_qpixmap(out_img).scaled(300, 300, Qt.KeepAspectRatio)
+            )
+
+            ow, oh = img.size
+            fw, fh = out_img.size
+            orig_mem = estimate_memory_mb(ow, oh)
+            final_mem = estimate_memory_mb(fw, fh)
+            saved = orig_mem - final_mem
+            saved_pct = (saved / orig_mem) * 100 if orig_mem > 0 else 0
+
+            self.multi_original_info.setText(
+                f"Size: {ow}×{oh}\n"
+                f"Memory: {orig_mem:.2f} MB"
+            )
+            self.multi_cropped_info.setText(
+                f"Final: {fw}×{fh}\n"
+                f"Memory: {final_mem:.2f} MB\n"
+                f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
+            )
+            self.multi_info_label.setText(
+                f"{src.name} optimized ({self.multi_mode_combo.currentText()})"
+            )
+        except Exception as e:
+            self.multi_cropped_preview.setText("Optimization failed")
+            self.multi_cropped_info.setText("Size: -\nMemory: -\nSaved: -")
+            self.multi_info_label.setText(f"Failed to preview frame: {e}")
+
+    def export_selected_multi_frame(self):
+        if not self.multi_frame_paths:
+            QMessageBox.information(self, "Info", "No frames loaded.")
+            return
+
+        current_path = self.multi_frame_combo.currentData()
+        if not current_path:
+            QMessageBox.information(self, "Info", "Select a frame first.")
+            return
+
+        src = Path(current_path)
+        try:
+            img = Image.open(str(src))
+            out_img = self.optimize_image_for_export(img, target=self.get_multi_target_canvas_size())
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to process frame:\n{e}")
+            return
+
+        default_name = f"{src.stem}_optimized{src.suffix}"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Optimized Frame",
+            str(src.with_name(default_name)),
+            "Images (*.png *.jpg *.jpeg *.bmp)"
+        )
+        if not save_path:
+            return
+
+        try:
+            out_img.save(save_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save frame:\n{e}")
+            return
+
+        QMessageBox.information(self, "Saved", f"Saved frame to:\n{save_path}")
+
+    def export_all_multi_frames(self):
+        if not self.multi_frame_paths:
+            QMessageBox.information(self, "Info", "No frames loaded.")
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Output Folder", "")
+        if not out_dir:
+            return
+
+        out_folder = Path(out_dir)
+        progress = QProgressDialog("Exporting frames...", None, 0, len(self.multi_frame_paths), self)
+        progress.setWindowTitle("Export All Frames")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        success = 0
+        failed = []
+        for i, src in enumerate(self.multi_frame_paths, start=1):
+            progress.setLabelText(f"Processing {src.name} ({i}/{len(self.multi_frame_paths)})...")
+            QApplication.processEvents()
+            try:
+                img = Image.open(str(src))
+                out_img = self.optimize_image_for_export(img, target=self.get_multi_target_canvas_size())
+                out_path = out_folder / f"{src.stem}_optimized{src.suffix}"
+                out_img.save(str(out_path))
+                success += 1
+            except Exception as e:
+                failed.append(f"{src.name}: {e}")
+
+            progress.setValue(i)
+            QApplication.processEvents()
+
+        progress.close()
+
+        if failed:
+            preview = "\n".join(failed[:3])
+            more = "" if len(failed) <= 3 else f"\n...and {len(failed) - 3} more"
+            QMessageBox.warning(
+                self,
+                "Export Complete (with issues)",
+                f"Exported {success}/{len(self.multi_frame_paths)} frames to:\n{out_folder}\n\n"
+                f"Failed:\n{preview}{more}"
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported {success} frames to:\n{out_folder}"
+            )
 
 
 if __name__ == "__main__":
