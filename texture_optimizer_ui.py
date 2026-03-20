@@ -87,6 +87,9 @@ class ManualCropLabel(QLabel):
         self._geom = (0, 0, 0, 0, 1.0)  # ox, oy, dw, dh, scale
         self._manual_zoom = 1.35
         self._focus_center = None  # (x, y) in image coordinates
+        self._pad_limit_x = 0
+        self._pad_limit_y = 0
+        self._content_bbox = None  # tight visible content bbox in image coords
         self.setMouseTracking(True)
 
     def set_manual_zoom(self, zoom):
@@ -96,13 +99,17 @@ class ManualCropLabel(QLabel):
     def get_manual_zoom(self):
         return self._manual_zoom
 
-    def set_manual_state(self, pil_img, rect):
+    def set_manual_state(self, pil_img, rect, content_bbox=None):
         self._pil_image = pil_img
         self._pixmap = pil_to_qpixmap(pil_img)
         self._manual_enabled = True
         self._rect = tuple(int(v) for v in rect)
+        self._content_bbox = tuple(content_bbox) if content_bbox is not None else None
         l, t, r, b = self._rect
         self._focus_center = ((l + r) / 2.0, (t + b) / 2.0)
+        iw, ih = pil_img.size
+        self._pad_limit_x = max(512, iw * 2)
+        self._pad_limit_y = max(512, ih * 2)
         self.update()
 
     def disable_manual(self):
@@ -114,7 +121,17 @@ class ManualCropLabel(QLabel):
         self._drag_start = None
         self._start_rect = None
         self._focus_center = None
+        self._pad_limit_x = 0
+        self._pad_limit_y = 0
+        self._content_bbox = None
         self.update()
+
+    def _is_cutting_content(self):
+        if self._rect is None or self._content_bbox is None:
+            return False
+        l, t, r, b = self._rect
+        cl, ct, cr, cb = self._content_bbox
+        return l > cl or t > ct or r < cr or b < cb
 
     def _compute_draw_geometry(self):
         if self._pil_image is None:
@@ -134,17 +151,6 @@ class ManualCropLabel(QLabel):
             fx, fy = self._focus_center
             ox = int((self.width() / 2.0) - (fx * scale))
             oy = int((self.height() / 2.0) - (fy * scale))
-
-            # Clamp so viewport remains stable and valid.
-            if dw >= self.width():
-                ox = max(self.width() - dw, min(0, ox))
-            else:
-                ox = (self.width() - dw) // 2
-
-            if dh >= self.height():
-                oy = max(self.height() - dh, min(0, oy))
-            else:
-                oy = (self.height() - dh) // 2
         else:
             ox = (self.width() - dw) // 2
             oy = (self.height() - dh) // 2
@@ -185,6 +191,10 @@ class ManualCropLabel(QLabel):
         y = int(oy + t * scale)
         w = int((r - l) * scale)
         h = int((b - t) * scale)
+        sel_w = max(1, r - l)
+        sel_h = max(1, b - t)
+        is_mult4 = (sel_w % 4 == 0 and sel_h % 4 == 0)
+        is_cutting = self._is_cutting_content()
 
         # Checkerboard only inside the manual crop box.
         self._draw_checkerboard(painter, x, y, max(1, w), max(1, h))
@@ -199,22 +209,24 @@ class ManualCropLabel(QLabel):
         painter.fillRect(0, y, max(0, x), max(0, h), shade)
         painter.fillRect(x + w, y, max(0, self.width() - (x + w)), max(0, h), shade)
 
-        pen = QPen(QColor(0, 255, 0), 2)
+        frame_color = QColor(255, 60, 60) if is_cutting else QColor(0, 255, 0)
+        pen = QPen(frame_color, 2)
         painter.setPen(pen)
         painter.drawRect(x, y, max(1, w), max(1, h))
 
         # Handles
         hs = 6
-        painter.setBrush(QColor(0, 255, 0))
+        painter.setBrush(frame_color)
         painter.drawRect(x - hs // 2, y - hs // 2, hs, hs)
         painter.drawRect(x + w - hs // 2, y - hs // 2, hs, hs)
         painter.drawRect(x - hs // 2, y + h - hs // 2, hs, hs)
         painter.drawRect(x + w - hs // 2, y + h - hs // 2, hs, hs)
 
-        size_text = f"{max(1, r - l)} × {max(1, b - t)}"
+        size_text = f"{sel_w} × {sel_h}"
         painter.setPen(QColor(0, 0, 0))
-        painter.fillRect(x, max(0, y - 24), 110, 20, QColor(0, 255, 0))
+        painter.fillRect(x, max(0, y - 24), 120, 20, frame_color)
         painter.drawText(x + 6, max(14, y - 9), size_text)
+
         painter.end()
 
     def _to_image_pos(self, px, py):
@@ -226,8 +238,8 @@ class ManualCropLabel(QLabel):
         if self._pil_image is None:
             return (0, 0)
         iw, ih = self._pil_image.size
-        rx = max(0, min(iw, int(round(rx))))
-        ry = max(0, min(ih, int(round(ry))))
+        rx = max(-self._pad_limit_x, min(iw + self._pad_limit_x, int(round(rx))))
+        ry = max(-self._pad_limit_y, min(ih + self._pad_limit_y, int(round(ry))))
         return (rx, ry)
 
     def _hit_mode(self, px, py):
@@ -263,8 +275,6 @@ class ManualCropLabel(QLabel):
             return "t"
         if near_b and x1 <= px <= x2:
             return "b"
-        if inside:
-            return "move"
         return None
 
     def mousePressEvent(self, event):
@@ -287,8 +297,8 @@ class ManualCropLabel(QLabel):
 
         if self._drag_mode is None or self._drag_start is None or self._start_rect is None:
             mode = self._hit_mode(event.x(), event.y())
-            if mode in {"move", "l", "r", "t", "b", "tl", "tr", "bl", "br"}:
-                self.setCursor(Qt.SizeAllCursor if mode == "move" else Qt.CrossCursor)
+            if mode in {"l", "r", "t", "b", "tl", "tr", "bl", "br"}:
+                self.setCursor(Qt.CrossCursor)
             else:
                 self.setCursor(Qt.ArrowCursor)
             return
@@ -305,24 +315,34 @@ class ManualCropLabel(QLabel):
         if self._drag_mode == "move":
             w = r - l
             h = b - t
-            nl = max(0, min(iw - w, l + dx))
-            nt = max(0, min(ih - h, t + dy))
+            min_l = -self._pad_limit_x
+            max_l = iw + self._pad_limit_x - w
+            min_t = -self._pad_limit_y
+            max_t = ih + self._pad_limit_y - h
+            nl = max(min_l, min(max_l, l + dx))
+            nt = max(min_t, min(max_t, t + dy))
             nr = nl + w
             nb = nt + h
         else:
             nl, nt, nr, nb = l, t, r, b
+            min_l = -self._pad_limit_x
+            max_r = iw + self._pad_limit_x
+            min_t = -self._pad_limit_y
+            max_b = ih + self._pad_limit_y
             if "l" in self._drag_mode:
-                nl = max(0, min(r - min_size, l + dx))
+                nl = max(min_l, min(r - min_size, l + dx))
             if "r" in self._drag_mode:
-                nr = min(iw, max(l + min_size, r + dx))
+                nr = min(max_r, max(l + min_size, r + dx))
             if "t" in self._drag_mode:
-                nt = max(0, min(b - min_size, t + dy))
+                nt = max(min_t, min(b - min_size, t + dy))
             if "b" in self._drag_mode:
-                nb = min(ih, max(t + min_size, b + dy))
+                nb = min(max_b, max(t + min_size, b + dy))
 
         new_rect = (int(nl), int(nt), int(nr), int(nb))
         if new_rect != self._rect:
             self._rect = new_rect
+            l2, t2, r2, b2 = self._rect
+            self._focus_center = ((l2 + r2) / 2.0, (t2 + b2) / 2.0)
             self.rectChanged.emit(self._rect)
             self.update()
 
@@ -777,19 +797,38 @@ class TextureOptimizerUI(QWidget):
             progress.setLabelText("Finding initial crop area...")
             progress.setValue(80)
             QApplication.processEvents()
-            bbox = img.split()[3].getbbox()
-            if bbox is None:
+            tight_bbox = img.split()[3].getbbox()
+            if tight_bbox is None:
                 progress.close()
                 QMessageBox.information(self, "Info", "No visible pixels found.")
                 return
 
+            # Start Manual mode from auto-crop bounds, but keep the FULL image
+            # as editable area so users can expand crop wider/taller as needed.
+            bbox = tight_bbox
             bbox = expand_bbox_to_multiple_of_4(bbox, img.size)
 
+            l, t, r, b = bbox
+            bw = max(1, r - l)
+            bh = max(1, b - t)
+            margin_x = max(8, bw // 4)
+            margin_y = max(8, bh // 4)
+
+            # Slightly wider initial rectangle for easier first adjustment.
+            il, it = 0, 0
+            ir, ib = img.size
+            init_rect = (
+                max(il, l - margin_x),
+                max(it, t - margin_y),
+                min(ir, r + margin_x),
+                min(ib, b + margin_y),
+            )
+
             self.manual_base_image = img
-            self.manual_rect = bbox
-            self.cropped_preview.set_manual_state(img, bbox)
+            self.manual_rect = init_rect
+            self.cropped_preview.set_manual_state(img, init_rect, content_bbox=tight_bbox)
             self._update_manual_zoom_ui()
-            self._on_manual_rect_changed(bbox)
+            self._on_manual_rect_changed(init_rect)
 
             progress.setValue(100)
             QApplication.processEvents()
@@ -807,7 +846,22 @@ class TextureOptimizerUI(QWidget):
         if r <= l or b <= t:
             return
 
-        cropped = crop_to_bbox(self.manual_base_image, self.manual_rect)
+        src = self.manual_base_image
+        iw, ih = src.size
+        out_w = r - l
+        out_h = b - t
+        cropped = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+
+        ix1 = max(0, l)
+        iy1 = max(0, t)
+        ix2 = min(iw, r)
+        iy2 = min(ih, b)
+        if ix2 > ix1 and iy2 > iy1:
+            part = crop_to_bbox(src, (ix1, iy1, ix2, iy2))
+            paste_x = ix1 - l
+            paste_y = iy1 - t
+            cropped.paste(part, (paste_x, paste_y), part)
+
         final = expand_to_multiple_of_4(cropped)
         self.cropped_image = final
         self.export_btn.setEnabled(True)
@@ -826,7 +880,10 @@ class TextureOptimizerUI(QWidget):
             f"Memory: {final_mem:.2f} MB\n"
             f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
         )
-        self.summary_label.setText(f"Manual selection: {cw}×{ch} (drag green box)")
+        if (cw % 4) != 0 or (ch % 4) != 0:
+            self.summary_label.setText(f"⚠ Manual selection: {cw}×{ch} (not multiple of 4)")
+        else:
+            self.summary_label.setText(f"Manual selection: {cw}×{ch} (drag green box)")
 
     # ---------------------------
     # Auto crop
