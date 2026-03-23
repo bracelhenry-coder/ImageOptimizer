@@ -29,6 +29,16 @@ QLabel#infoLabel {
     margin-top: 8px;
 }
 
+QLabel#originalInfoLabel {
+    color: #ffaaaa;
+    font-weight: bold;
+    padding: 6px;
+    border: 1px solid #aa3333;
+    border-radius: 4px;
+    background-color: #330000;
+    margin-top: 8px;
+}
+
 QLabel#summaryLabel {
     margin-top: 10px;
     padding: 6px;
@@ -131,6 +141,30 @@ QTabBar::tab:selected {
     color: #ffffff;
     font-weight: bold;
     border-bottom: 2px solid #2b2b2b;
+}
+
+QTabBar::tab:first:selected {
+    background-color: #1f3f56;
+    color: #eff9ff;
+    border-color: #4d88aa;
+    border-bottom: 2px solid #1f3f56;
+}
+
+QTabBar::tab:first:hover {
+    background-color: #29506b;
+    color: #f4fbff;
+}
+
+QTabBar::tab:last:selected {
+    background-color: #22465b;
+    color: #eef8ff;
+    border-color: #4d86a7;
+    border-bottom: 2px solid #22465b;
+}
+
+QTabBar::tab:last:hover {
+    background-color: #2a5470;
+    color: #f4fbff;
 }
 
 QTabBar::tab:hover {

@@ -1,14 +1,16 @@
 import sys
+import os
+from io import BytesIO
 from pathlib import Path
 
 from PySide2.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QMessageBox, QProgressDialog, QComboBox, QSpinBox, QTabWidget
+    QFileDialog, QMessageBox, QProgressDialog, QComboBox, QSpinBox, QTabWidget, QStyle
 )
 from PySide2.QtGui import QPixmap, QImage, QPainter, QPen, QColor
-from PySide2.QtCore import Qt, Signal
+from PySide2.QtCore import Qt, Signal, QTimer, QSize
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from image_tools import (
     find_tight_bbox,
@@ -19,6 +21,21 @@ from image_tools import (
     draw_crop_outline,
     estimate_memory_mb
 )
+from optimizer_utils import (
+    draw_canvas_preview,
+    finalize_prepared_content,
+    is_supported_frames_folder,
+    is_supported_image_path,
+    list_frame_images,
+    next_multiple_of_4,
+    prepare_optimized_content,
+)
+
+
+def resource_path(relative):
+    """Resolve path to a bundled resource, works both frozen (PyInstaller) and in dev."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
 
 
 def pil_to_qpixmap(pil_image):
@@ -34,42 +51,24 @@ def pil_to_qpixmap(pil_image):
     return QPixmap.fromImage(qimage)
 
 
-def draw_canvas_preview(content_img, canvas_w, canvas_h, preview_size=300):
-    """
-    Visualize how content sits inside a target canvas.
-    Renders at preview_size resolution so it's always fast.
-    Shows a checkerboard background for empty space.
-    """
-    scale = min(preview_size / canvas_w, preview_size / canvas_h, 1.0)
-    disp_w = max(1, int(canvas_w * scale))
-    disp_h = max(1, int(canvas_h * scale))
+def format_file_size(num_bytes):
+    size = float(max(0, num_bytes))
+    units = ["B", "KB", "MB", "GB"]
+    unit = units[0]
+    for next_unit in units[1:]:
+        if size < 1024.0:
+            break
+        size /= 1024.0
+        unit = next_unit
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    return f"{size:.2f} {unit}"
 
-    check = 10
-    canvas = Image.new("RGBA", (disp_w, disp_h))
-    draw = ImageDraw.Draw(canvas)
-    for y in range(0, disp_h, check):
-        for x in range(0, disp_w, check):
-            c = (52, 52, 52, 255) if ((x // check) + (y // check)) % 2 == 0 else (32, 32, 32, 255)
-            draw.rectangle(
-                [x, y, min(x + check - 1, disp_w - 1), min(y + check - 1, disp_h - 1)],
-                fill=c
-            )
 
-    cw, ch = content_img.size
-    disp_cw = max(1, int(cw * scale))
-    disp_ch = max(1, int(ch * scale))
-    content_scaled = content_img.resize((disp_cw, disp_ch), Image.NEAREST)
-
-    ox = (disp_w - disp_cw) // 2
-    oy = (disp_h - disp_ch) // 2
-    canvas.paste(content_scaled, (ox, oy), content_scaled)
-
-    # Canvas border
-    draw.rectangle([0, 0, disp_w - 1, disp_h - 1], outline=(80, 80, 80, 255), width=2)
-    # Content bounds outline
-    draw.rectangle([ox, oy, ox + disp_cw, oy + disp_ch], outline=(0, 255, 0, 255), width=3)
-
-    return canvas
+def estimate_png_disk_size_bytes(pil_image):
+    buf = BytesIO()
+    pil_image.save(buf, format="PNG")
+    return len(buf.getvalue())
 
 
 class ManualCropLabel(QLabel):
@@ -355,6 +354,9 @@ class ManualCropLabel(QLabel):
 
 
 class TextureOptimizerUI(QWidget):
+    ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
+    MULTI_PLAYBACK_INTERVAL_MS = 33
+
     ALERT_INFO_STYLE = (
         "color: #ffb3b3;"
         "font-weight: bold;"
@@ -369,7 +371,8 @@ class TextureOptimizerUI(QWidget):
         super().__init__()
         self.setWindowTitle("Texture Memory Optimizer")
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
-        self.setStyleSheet(open("style.qss").read())
+        self.setAcceptDrops(True)
+        self.setStyleSheet(open(resource_path("style.qss")).read())
 
         self.original_path = None
         self.original_image = None
@@ -378,19 +381,27 @@ class TextureOptimizerUI(QWidget):
         self.manual_rect = None
         self.multi_folder = None
         self.multi_frame_paths = []
+        self.multi_auto_target_size = None
+        self.multi_max_content_size = None
+        self.multi_current_original_mem = 0.0
+        self.multi_source_cache = {}
+        self.multi_prepared_cache = {}
+        self.multi_preview_cache = {}
+        self.multi_player_timer = QTimer(self)
+        self.multi_player_timer.timeout.connect(self._advance_multi_frame)
 
         self.init_ui()
 
     def init_ui(self):
         # Original panel
-        self.original_title = QLabel("Original Image")
+        self.original_title = QLabel("Original Image:")
         self.original_title.setObjectName("panelTitle")
 
         self.original_preview = QLabel("No image loaded")
         self.original_preview.setAlignment(Qt.AlignCenter)
         self.original_preview.setObjectName("imagePreview")
 
-        self.original_info = QLabel("Size: -\nMemory: -")
+        self.original_info = QLabel("Size: -\nRaw Memory: -\nDisk Size: -")
         self.original_info.setObjectName("infoLabel")
 
         original_layout = QVBoxLayout()
@@ -399,7 +410,7 @@ class TextureOptimizerUI(QWidget):
         original_layout.addWidget(self.original_info)
 
         # Optimized panel
-        self.cropped_title = QLabel("Optimized Image")
+        self.cropped_title = QLabel("Optimized Image:")
         self.cropped_title.setObjectName("panelTitle")
 
         # Mode dropdown next to the Optimized title
@@ -489,7 +500,7 @@ class TextureOptimizerUI(QWidget):
         self.cropped_preview.setObjectName("imagePreview")
         self.cropped_preview.rectChanged.connect(self._on_manual_rect_changed)
 
-        self.cropped_info = QLabel("Size: -\nMemory: -\nSaved: -")
+        self.cropped_info = QLabel("Size: -\nRaw Memory: -\nDisk Size: -\nSaved: -")
         self.cropped_info.setObjectName("infoLabel")
 
         cropped_layout = QVBoxLayout()
@@ -531,21 +542,15 @@ class TextureOptimizerUI(QWidget):
         single_page_layout.addLayout(button_layout)
 
         single_frame_widget = QWidget()
+        single_frame_widget.setObjectName("singleFramePage")
         single_frame_widget.setLayout(single_page_layout)
 
         # --- Multi Frame page ---
-        multi_title = QLabel("Multi Frame")
-        multi_title.setObjectName("panelTitle")
-
-        multi_select_row = QHBoxLayout()
-        multi_select_row.addWidget(QLabel("Select Frame:"))
-
         self.multi_frame_combo = QComboBox()
         self.multi_frame_combo.setObjectName("sizeCombo")
         self.multi_frame_combo.setMinimumWidth(220)
         self.multi_frame_combo.setEnabled(False)
         self.multi_frame_combo.currentIndexChanged.connect(self.refresh_multi_frame_preview)
-        multi_select_row.addWidget(self.multi_frame_combo)
 
         self.multi_mode_combo = QComboBox()
         self.multi_mode_combo.setObjectName("sizeCombo")
@@ -553,37 +558,94 @@ class TextureOptimizerUI(QWidget):
         self.multi_mode_combo.addItems(["Auto", "128 × 128", "256 × 256", "512 × 512", "1024 × 1024", "2048 × 2048"])
         self.multi_mode_combo.setEnabled(False)
         self.multi_mode_combo.currentTextChanged.connect(self.refresh_multi_frame_preview)
-        multi_select_row.addSpacing(8)
-        multi_select_row.addWidget(self.multi_mode_combo)
-        multi_select_row.addStretch()
+
+        self.multi_prev_btn = QPushButton()
+        self.multi_prev_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekBackward))
+        self.multi_prev_btn.setIconSize(QSize(36, 36))
+        self.multi_prev_btn.setToolTip("Previous frame")
+        self.multi_prev_btn.setAccessibleName("Previous frame")
+        self.multi_prev_btn.setFixedSize(44, 44)
+        self.multi_prev_btn.setEnabled(False)
+        self.multi_prev_btn.clicked.connect(self.go_to_prev_multi_frame)
+
+        self.multi_play_btn = QPushButton()
+        self.multi_play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.multi_play_btn.setIconSize(QSize(36, 36))
+        self.multi_play_btn.setToolTip("Play optimized preview")
+        self.multi_play_btn.setAccessibleName("Play optimized preview")
+        self.multi_play_btn.setFixedSize(44, 44)
+        self.multi_play_btn.setEnabled(False)
+        self.multi_play_btn.clicked.connect(self.start_multi_playback)
+
+        self.multi_stop_btn = QPushButton()
+        self.multi_stop_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.multi_stop_btn.setIconSize(QSize(36, 36))
+        self.multi_stop_btn.setToolTip("Stop optimized preview")
+        self.multi_stop_btn.setAccessibleName("Stop optimized preview")
+        self.multi_stop_btn.setFixedSize(44, 44)
+        self.multi_stop_btn.setEnabled(False)
+        self.multi_stop_btn.clicked.connect(self.stop_multi_playback)
+
+        self.multi_next_btn = QPushButton()
+        self.multi_next_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekForward))
+        self.multi_next_btn.setIconSize(QSize(36, 36))
+        self.multi_next_btn.setToolTip("Next frame")
+        self.multi_next_btn.setAccessibleName("Next frame")
+        self.multi_next_btn.setFixedSize(44, 44)
+        self.multi_next_btn.setEnabled(False)
+        self.multi_next_btn.clicked.connect(self.go_to_next_multi_frame)
+
+        self.multi_frame_counter = QLabel("- / -")
+        self.multi_frame_counter.setObjectName("infoLabel")
+        self.multi_frame_counter.setAlignment(Qt.AlignCenter)
+        self.multi_frame_counter.setMinimumWidth(120)
 
         self.multi_original_preview = QLabel("No frame loaded")
         self.multi_original_preview.setAlignment(Qt.AlignCenter)
         self.multi_original_preview.setObjectName("imagePreview")
 
-        self.multi_original_info = QLabel("Size: -\nMemory: -")
-        self.multi_original_info.setObjectName("infoLabel")
+        self.multi_original_info = QLabel("Size: -\nRaw Memory: -\nDisk Size: -")
+        self.multi_original_info.setObjectName("originalInfoLabel")
 
         self.multi_cropped_preview = QLabel("No optimized frame yet")
         self.multi_cropped_preview.setAlignment(Qt.AlignCenter)
         self.multi_cropped_preview.setObjectName("imagePreview")
 
-        self.multi_cropped_info = QLabel("Size: -\nMemory: -\nSaved: -")
+        self.multi_cropped_info = QLabel("Size: -\nRaw Memory: -\nDisk Size: -\nSaved: -")
         self.multi_cropped_info.setObjectName("infoLabel")
 
-        multi_left = QVBoxLayout()
-        multi_left.addWidget(QLabel("Original Frame"))
-        multi_left.addWidget(self.multi_original_preview)
-        multi_left.addWidget(self.multi_original_info)
+        # Header: all on one line
+        multi_right_header = QHBoxLayout()
+        multi_right_header.addStretch()
+        multi_right_header.addWidget(QLabel("Frame:"))
+        multi_right_header.addWidget(self.multi_frame_combo)
+        multi_right_header.addSpacing(8)
+        multi_right_header.addWidget(self.multi_mode_combo)
+        multi_right_header.addStretch()
 
         multi_right = QVBoxLayout()
-        multi_right.addWidget(QLabel("Optimized Frame"))
-        multi_right.addWidget(self.multi_cropped_preview)
-        multi_right.addWidget(self.multi_cropped_info)
+        multi_right.addLayout(multi_right_header)
 
-        multi_images = QHBoxLayout()
-        multi_images.addLayout(multi_left)
-        multi_images.addLayout(multi_right)
+        multi_preview_row = QHBoxLayout()
+        multi_preview_row.addWidget(self.multi_prev_btn)
+        multi_preview_row.addWidget(self.multi_cropped_preview)
+        multi_preview_row.addWidget(self.multi_next_btn)
+
+        multi_controls_row = QHBoxLayout()
+        multi_controls_row.addStretch()
+        multi_controls_row.addWidget(self.multi_play_btn)
+        multi_controls_row.addWidget(self.multi_stop_btn)
+        multi_controls_row.addSpacing(8)
+        multi_controls_row.addWidget(self.multi_frame_counter)
+        multi_controls_row.addStretch()
+
+        multi_info_panels_row = QHBoxLayout()
+        multi_info_panels_row.addWidget(self.multi_original_info)
+        multi_info_panels_row.addWidget(self.multi_cropped_info)
+
+        multi_right.addLayout(multi_preview_row)
+        multi_right.addLayout(multi_controls_row)
+        multi_right.addLayout(multi_info_panels_row)
 
         self.multi_info_label = QLabel("Select a folder to load all frames.")
         self.multi_info_label.setObjectName("summaryLabel")
@@ -609,13 +671,12 @@ class TextureOptimizerUI(QWidget):
 
         multi_frame_layout = QVBoxLayout()
         multi_frame_layout.setContentsMargins(8, 8, 8, 8)
-        multi_frame_layout.addWidget(multi_title)
-        multi_frame_layout.addLayout(multi_select_row)
-        multi_frame_layout.addLayout(multi_images)
+        multi_frame_layout.addLayout(multi_right)
         multi_frame_layout.addWidget(self.multi_info_label)
         multi_frame_layout.addLayout(multi_buttons)
 
         multi_frame_widget = QWidget()
+        multi_frame_widget.setObjectName("multiFramePage")
         multi_frame_widget.setLayout(multi_frame_layout)
 
         # --- Tab widget ---
@@ -627,6 +688,60 @@ class TextureOptimizerUI(QWidget):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.addWidget(self.tab_widget)
         self.setLayout(outer_layout)
+
+    def dragEnterEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        dropped_paths = self._get_dropped_local_paths(event)
+        if any(is_supported_image_path(path, self.ALLOWED_IMAGE_SUFFIXES) for path in dropped_paths):
+            event.acceptProposedAction()
+            return
+
+        if any(is_supported_frames_folder(path, self.ALLOWED_IMAGE_SUFFIXES) for path in dropped_paths):
+            event.acceptProposedAction()
+            return
+
+        event.ignore()
+
+    def dropEvent(self, event):
+        dropped_paths = self._get_dropped_local_paths(event)
+
+        folder_path = next((
+            path for path in dropped_paths
+            if is_supported_frames_folder(path, self.ALLOWED_IMAGE_SUFFIXES)
+        ), None)
+        if folder_path is not None:
+            self.tab_widget.setCurrentIndex(1)
+            self._load_multi_folder(folder_path)
+            event.acceptProposedAction()
+            return
+
+        image_path = next((
+            path for path in dropped_paths
+            if is_supported_image_path(path, self.ALLOWED_IMAGE_SUFFIXES)
+        ), None)
+
+        if image_path is None:
+            QMessageBox.information(
+                self,
+                "Unsupported Drop",
+                "Drop a supported image file or a folder containing image frames (.png, .jpg, .jpeg, .bmp)."
+            )
+            event.ignore()
+            return
+
+        self.tab_widget.setCurrentIndex(0)
+        self.load_original_image(str(image_path))
+        event.acceptProposedAction()
+
+    def _get_dropped_local_paths(self, event):
+        paths = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                paths.append(Path(url.toLocalFile()))
+        return paths
 
     # ---------------------------
     # Mode dropdown helpers
@@ -751,13 +866,14 @@ class TextureOptimizerUI(QWidget):
 
         self.original_info.setText(
             f"Size: {w}×{h}\n"
-            f"Memory: {mem:.2f} MB\n"
+            f"Raw Memory: {mem:.2f} MB\n"
+            f"Disk Size: {format_file_size(os.path.getsize(path))}\n"
             f"Empty: {empty_pct:.1f}%\n"
             f"{status}"
         )
 
         self.cropped_preview.setText("No crop yet")
-        self.cropped_info.setText("Size: -\nMemory: -\nSaved: -")
+        self.cropped_info.setText("Size: -\nRaw Memory: -\nDisk Size: -\nSaved: -")
         if self.mode_combo.currentText() == "Custom...":
             self.summary_label.setText("Image loaded. Set custom size and press Update.")
         elif self.mode_combo.currentText() == "Manual":
@@ -877,7 +993,8 @@ class TextureOptimizerUI(QWidget):
         self.cropped_info.setText(
             f"Manual: {cw}×{ch}\n"
             f"Final: {fw}×{fh}\n"
-            f"Memory: {final_mem:.2f} MB\n"
+            f"Raw Memory: {final_mem:.2f} MB\n"
+            f"Disk Size: (updates on export)\n"
             f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
         )
         if (cw % 4) != 0 or (ch % 4) != 0:
@@ -1000,16 +1117,20 @@ class TextureOptimizerUI(QWidget):
             saved_pct = (saved / orig_mem) * 100 if orig_mem > 0 else 0
 
             if target is None:
+                disk_est = format_file_size(estimate_png_disk_size_bytes(final))
                 self.cropped_info.setText(
                     f"Final: {fw}×{fh}\n"
-                    f"Memory: {final_mem:.2f} MB\n"
+                    f"Raw Memory: {final_mem:.2f} MB\n"
+                    f"Disk Size (PNG est.): {disk_est}\n"
                     f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
                 )
             else:
+                disk_est = format_file_size(estimate_png_disk_size_bytes(final))
                 self.cropped_info.setText(
                     f"Content: {cropped.size[0]}×{cropped.size[1]}\n"
                     f"Final: {fw}×{fh}\n"
-                    f"Memory: {final_mem:.2f} MB\n"
+                    f"Raw Memory: {final_mem:.2f} MB\n"
+                    f"Disk Size (PNG est.): {disk_est}\n"
                     f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
                 )
 
@@ -1051,7 +1172,13 @@ class TextureOptimizerUI(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
             return
 
-        QMessageBox.information(self, "Saved", f"Saved to:\n{save_path}")
+        disk_size = format_file_size(os.path.getsize(save_path)) if os.path.exists(save_path) else "Unknown"
+
+        QMessageBox.information(
+            self,
+            "Saved",
+            f"Saved to:\n{save_path}\n\nActual File Size: {disk_size}"
+        )
 
     # ---------------------------
     # Multi frame
@@ -1065,12 +1192,12 @@ class TextureOptimizerUI(QWidget):
         if not folder_path:
             return
 
-        folder = Path(folder_path)
-        allowed = {".png", ".jpg", ".jpeg", ".bmp"}
-        frames = sorted(
-            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in allowed],
-            key=lambda p: p.name.lower()
-        )
+        self._load_multi_folder(Path(folder_path))
+
+    def _load_multi_folder(self, folder):
+        folder = Path(folder)
+
+        frames = list_frame_images(folder, self.ALLOWED_IMAGE_SUFFIXES)
 
         if not frames:
             QMessageBox.information(self, "Info", "No image frames found in that folder.")
@@ -1078,48 +1205,161 @@ class TextureOptimizerUI(QWidget):
 
         self.multi_folder = folder
         self.multi_frame_paths = frames
+        self.multi_auto_target_size = None
+        self.multi_max_content_size = None
+        self.multi_current_original_mem = 0.0
+        self.multi_source_cache = {}
+        self.multi_prepared_cache = {}
+        self.multi_preview_cache = {}
+        self.stop_multi_playback()
 
         self.multi_frame_combo.blockSignals(True)
         self.multi_frame_combo.clear()
         for i, p in enumerate(frames):
-            self.multi_frame_combo.addItem(f"Frame {i + 1}", str(p))
+            self.multi_frame_combo.addItem(f"Frame {i + 1}: {p.name}", str(p))
         self.multi_frame_combo.setCurrentIndex(0)
         self.multi_frame_combo.blockSignals(False)
 
+        # Pre-process all frames once: fills prepared-cache and computes max content size
+        progress = QProgressDialog("Pre-processing frames...", None, 0, len(frames), self)
+        progress.setWindowTitle("Multi Frame Loading")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+        max_w, max_h = 0, 0
+        try:
+            for idx, fp in enumerate(frames, start=1):
+                progress.setLabelText(f"Processing {fp.name} ({idx}/{len(frames)})...")
+                QApplication.processEvents()
+                cropped = self._get_multi_prepared_content(fp)
+                max_w = max(max_w, cropped.size[0])
+                max_h = max(max_h, cropped.size[1])
+                progress.setValue(idx)
+                QApplication.processEvents()
+        finally:
+            progress.close()
+        if max_w > 0 and max_h > 0:
+            self.multi_max_content_size = (max_w, max_h)
+
         self.multi_frame_combo.setEnabled(True)
         self.multi_mode_combo.setEnabled(True)
+        self.multi_prev_btn.setEnabled(True)
+        self.multi_play_btn.setEnabled(True)
+        self.multi_stop_btn.setEnabled(True)
+        self.multi_next_btn.setEnabled(True)
         self.multi_export_frame_btn.setEnabled(True)
         self.multi_export_all_btn.setEnabled(True)
         self.multi_info_label.setText(f"Loaded {len(frames)} frames from: {folder.name}")
         self.refresh_multi_frame_preview()
 
-    def optimize_image_for_export(self, source_img, target=None):
-        img = source_img.convert("RGBA")
-        img = remove_background(img)
+    def _get_multi_source_image(self, frame_path):
+        key = str(frame_path)
+        cached = self.multi_source_cache.get(key)
+        if cached is not None:
+            return cached.copy()
 
-        bbox = img.split()[3].getbbox()
-        if bbox is None:
-            raise ValueError("No visible pixels found after background removal.")
+        img = Image.open(str(frame_path))
+        prepared = img.copy()
+        self.multi_source_cache[key] = prepared
+        return prepared.copy()
 
-        bbox = expand_bbox_to_multiple_of_4(bbox, img.size)
-        cropped = crop_to_bbox(img, bbox)
+    def _get_multi_prepared_content(self, frame_path):
+        key = str(frame_path)
+        cached = self.multi_prepared_cache.get(key)
+        if cached is not None:
+            return cached.copy()
 
+        img = Image.open(str(frame_path))
+        prepared = prepare_optimized_content(img)
+        self.multi_prepared_cache[key] = prepared.copy()
+        return prepared.copy()
+
+    def _get_multi_preview_payload(self, frame_path, effective_target, outline_size):
+        cache_key = (str(frame_path), effective_target, outline_size)
+        cached = self.multi_preview_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        cropped = self._get_multi_prepared_content(frame_path)
+        final_img = finalize_prepared_content(cropped.copy(), target=effective_target)
+        if effective_target is not None:
+            preview_pixmap = pil_to_qpixmap(
+                draw_canvas_preview(cropped, effective_target[0], effective_target[1], outline_size=outline_size)
+            )
+        else:
+            preview_pixmap = pil_to_qpixmap(draw_crop_outline(final_img, cropped)).scaled(300, 300, Qt.KeepAspectRatio)
+
+        payload = {
+            "cropped_size": cropped.size,
+            "final_size": final_img.size,
+            "disk_size_est": format_file_size(estimate_png_disk_size_bytes(final_img)),
+            "preview_pixmap": preview_pixmap,
+        }
+        self.multi_preview_cache[cache_key] = payload
+        return payload
+
+    def get_multi_effective_target_canvas_size(self):
+        target = self.get_multi_target_canvas_size()
         if target is not None:
-            tw, th = target
-            cw, ch = cropped.size
-            if cw > tw or ch > th:
-                raise ValueError(
-                    f"Cropped content ({cw}×{ch}) is larger than target ({tw}×{th})."
-                )
-            canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            offset_x = (tw - cw) // 2
-            offset_y = (th - ch) // 2
-            canvas.paste(cropped, (offset_x, offset_y))
-            return canvas
+            return target
 
-        return expand_to_multiple_of_4(cropped)
+        if self.multi_auto_target_size is not None:
+            return self.multi_auto_target_size
+
+        if not self.multi_frame_paths:
+            return None
+
+        # Frames were pre-processed at load time; use cached max size directly
+        if self.multi_max_content_size is not None:
+            max_w, max_h = self.multi_max_content_size
+            self.multi_auto_target_size = (
+                next_multiple_of_4(max_w),
+                next_multiple_of_4(max_h),
+            )
+            return self.multi_auto_target_size
+
+        raise ValueError("Max content size not yet computed. Load a folder first.")
+
+    def _get_multi_outline_size(self):
+        return self.multi_max_content_size  # Always pre-computed at load time
+
+    def go_to_prev_multi_frame(self):
+        if not self.multi_frame_paths:
+            return
+        idx = (self.multi_frame_combo.currentIndex() - 1) % len(self.multi_frame_paths)
+        self.multi_frame_combo.setCurrentIndex(idx)
+
+    def go_to_next_multi_frame(self):
+        if not self.multi_frame_paths:
+            return
+        idx = (self.multi_frame_combo.currentIndex() + 1) % len(self.multi_frame_paths)
+        self.multi_frame_combo.setCurrentIndex(idx)
+
+    def start_multi_playback(self):
+        if len(self.multi_frame_paths) < 2:
+            return
+        self.multi_player_timer.start(self.MULTI_PLAYBACK_INTERVAL_MS)
+        self.multi_info_label.setText("Playing frames...")
+
+    def stop_multi_playback(self):
+        if self.multi_player_timer.isActive():
+            self.multi_player_timer.stop()
+
+    def _advance_multi_frame(self):
+        if not self.multi_frame_paths:
+            self.stop_multi_playback()
+            return
+        next_index = (self.multi_frame_combo.currentIndex() + 1) % len(self.multi_frame_paths)
+        self.multi_frame_combo.blockSignals(True)
+        self.multi_frame_combo.setCurrentIndex(next_index)
+        self.multi_frame_combo.blockSignals(False)
+        self._refresh_multi_frame_preview(update_original_preview=False)
 
     def refresh_multi_frame_preview(self):
+        self._refresh_multi_frame_preview(update_original_preview=True)
+
+    def _refresh_multi_frame_preview(self, update_original_preview):
         if not self.multi_frame_paths:
             return
 
@@ -1129,39 +1369,67 @@ class TextureOptimizerUI(QWidget):
 
         try:
             src = Path(current_path)
-            img = Image.open(str(src))
-            target = self.get_multi_target_canvas_size()
-            out_img = self.optimize_image_for_export(img, target=target)
+            requested_target = self.get_multi_target_canvas_size()
+            effective_target = self.get_multi_effective_target_canvas_size()
+            outline_size = self._get_multi_outline_size()
+            preview_payload = self._get_multi_preview_payload(src, effective_target, outline_size)
+            cropped_size = preview_payload["cropped_size"]
+            fw, fh = preview_payload["final_size"]
 
-            self.multi_original_preview.setPixmap(
-                pil_to_qpixmap(img).scaled(300, 300, Qt.KeepAspectRatio)
-            )
-            self.multi_cropped_preview.setPixmap(
-                pil_to_qpixmap(out_img).scaled(300, 300, Qt.KeepAspectRatio)
-            )
+            current_idx = self.multi_frame_combo.currentIndex()
+            total = len(self.multi_frame_paths)
+            frame_name = src.name
+            self.multi_frame_counter.setText(f"{frame_name}   {current_idx + 1} / {total}")
 
-            ow, oh = img.size
-            fw, fh = out_img.size
-            orig_mem = estimate_memory_mb(ow, oh)
+            if update_original_preview:
+                img = self._get_multi_source_image(src)
+                self.multi_original_preview.setPixmap(
+                    pil_to_qpixmap(img).scaled(300, 300, Qt.KeepAspectRatio)
+                )
+                ow, oh = img.size
+                orig_mem = estimate_memory_mb(ow, oh)
+                self.multi_current_original_mem = orig_mem
+                self.multi_original_info.setText(
+                    f"Size: {ow}×{oh}\n"
+                    f"Raw Memory: {orig_mem:.2f} MB\n"
+                    f"Disk Size: {format_file_size(os.path.getsize(str(src)))}"
+                )
+            else:
+                orig_mem = self.multi_current_original_mem
+
+            self.multi_cropped_preview.setPixmap(preview_payload["preview_pixmap"])
+
             final_mem = estimate_memory_mb(fw, fh)
             saved = orig_mem - final_mem
             saved_pct = (saved / orig_mem) * 100 if orig_mem > 0 else 0
 
-            self.multi_original_info.setText(
-                f"Size: {ow}×{oh}\n"
-                f"Memory: {orig_mem:.2f} MB"
-            )
-            self.multi_cropped_info.setText(
-                f"Final: {fw}×{fh}\n"
-                f"Memory: {final_mem:.2f} MB\n"
-                f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
-            )
-            self.multi_info_label.setText(
-                f"{src.name} optimized ({self.multi_mode_combo.currentText()})"
-            )
+            if requested_target is None:
+                self.multi_cropped_info.setText(
+                    f"Content: {cropped_size[0]}×{cropped_size[1]}\n"
+                    f"Shared: {fw}×{fh}\n"
+                    f"Raw Memory: {final_mem:.2f} MB\n"
+                    f"Disk Size (PNG est.): {preview_payload['disk_size_est']}\n"
+                    f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
+                )
+            else:
+                self.multi_cropped_info.setText(
+                    f"Content: {cropped_size[0]}×{cropped_size[1]}\n"
+                    f"Final: {fw}×{fh}\n"
+                    f"Raw Memory: {final_mem:.2f} MB\n"
+                    f"Disk Size (PNG est.): {preview_payload['disk_size_est']}\n"
+                    f"Saved: {saved:.2f} MB ({saved_pct:.1f}%)"
+                )
+            if requested_target is None and effective_target is not None:
+                self.multi_info_label.setText(
+                    f"{src.name} optimized (Auto shared {effective_target[0]}×{effective_target[1]})"
+                )
+            else:
+                self.multi_info_label.setText(
+                    f"{src.name} optimized ({self.multi_mode_combo.currentText()})"
+                )
         except Exception as e:
             self.multi_cropped_preview.setText("Optimization failed")
-            self.multi_cropped_info.setText("Size: -\nMemory: -\nSaved: -")
+            self.multi_cropped_info.setText("Size: -\nRaw Memory: -\nDisk Size: -\nSaved: -")
             self.multi_info_label.setText(f"Failed to preview frame: {e}")
 
     def export_selected_multi_frame(self):
@@ -1176,8 +1444,8 @@ class TextureOptimizerUI(QWidget):
 
         src = Path(current_path)
         try:
-            img = Image.open(str(src))
-            out_img = self.optimize_image_for_export(img, target=self.get_multi_target_canvas_size())
+            cropped = self._get_multi_prepared_content(src)
+            out_img = finalize_prepared_content(cropped, target=self.get_multi_effective_target_canvas_size())
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to process frame:\n{e}")
             return
@@ -1198,7 +1466,13 @@ class TextureOptimizerUI(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to save frame:\n{e}")
             return
 
-        QMessageBox.information(self, "Saved", f"Saved frame to:\n{save_path}")
+        disk_size = format_file_size(os.path.getsize(save_path)) if os.path.exists(save_path) else "Unknown"
+
+        QMessageBox.information(
+            self,
+            "Saved",
+            f"Saved frame to:\n{save_path}\n\nActual File Size: {disk_size}"
+        )
 
     def export_all_multi_frames(self):
         if not self.multi_frame_paths:
@@ -1219,14 +1493,17 @@ class TextureOptimizerUI(QWidget):
 
         success = 0
         failed = []
+        total_disk_bytes = 0
         for i, src in enumerate(self.multi_frame_paths, start=1):
             progress.setLabelText(f"Processing {src.name} ({i}/{len(self.multi_frame_paths)})...")
             QApplication.processEvents()
             try:
-                img = Image.open(str(src))
-                out_img = self.optimize_image_for_export(img, target=self.get_multi_target_canvas_size())
+                cropped = self._get_multi_prepared_content(src)
+                out_img = finalize_prepared_content(cropped, target=self.get_multi_effective_target_canvas_size())
                 out_path = out_folder / f"{src.stem}_optimized{src.suffix}"
                 out_img.save(str(out_path))
+                if out_path.exists():
+                    total_disk_bytes += out_path.stat().st_size
                 success += 1
             except Exception as e:
                 failed.append(f"{src.name}: {e}")
@@ -1243,13 +1520,15 @@ class TextureOptimizerUI(QWidget):
                 self,
                 "Export Complete (with issues)",
                 f"Exported {success}/{len(self.multi_frame_paths)} frames to:\n{out_folder}\n\n"
+                f"Actual Total File Size: {format_file_size(total_disk_bytes)}\n\n"
                 f"Failed:\n{preview}{more}"
             )
         else:
             QMessageBox.information(
                 self,
                 "Export Complete",
-                f"Exported {success} frames to:\n{out_folder}"
+                f"Exported {success} frames to:\n{out_folder}\n\n"
+                f"Actual Total File Size: {format_file_size(total_disk_bytes)}"
             )
 
 
